@@ -12,7 +12,7 @@ name: Deploy zh-CN to OSS used by omarchy.cn
 
 on:
   push:
-    branches: [master]
+    branches: [master, modify/omarchy-cn-noverify] # TEMPORARY
   pull_request:
   workflow_dispatch:
 
@@ -80,7 +80,8 @@ jobs:
     if: >-
       vars.OMARCHY_CN_OSS_HOST != '' &&
       github.event_name == 'push' &&
-      github.ref == 'refs/heads/master'
+      (github.ref == 'refs/heads/master' ||
+       github.ref == 'refs/heads/modify/omarchy-cn-noverify')
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
