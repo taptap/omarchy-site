@@ -24,15 +24,16 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Pinned so a deployment is reproducible; the archive is published by Alibaba
-  # Cloud at gosspublic.alicdn.com.
-  # ref: https://help.aliyun.com/zh/oss/developer-reference/install-ossutil2
-  OSSUTIL_VERSION: 2.4.0
-  # SHA-256 of ossutil-2.4.0-linux-amd64.zip. Recorded here rather than fetched
+  # Pinned so a deployment is reproducible. Not named RCLONE_*: rclone maps
+  # every RCLONE_<FLAG> environment variable onto the matching flag, so
+  # RCLONE_VERSION is read as --version and aborts the run.
+  # ref: https://rclone.org/docs/#environment-variables
+  OMARCHY_RCLONE_VERSION: 1.75.1
+  # SHA-256 of rclone-v1.75.1-linux-amd64.zip. Recorded here rather than fetched
   # alongside the archive: a checksum served by the same host as the download
   # would be replaced by anyone able to replace the download. Update both lines
   # together when moving version, taking the digest from a trusted machine.
-  OSSUTIL_SHA256: 85edf66b2fb7238f5c7e25cab820cf29312319fe4935b7c86a6b8485eb434f3c
+  OMARCHY_RCLONE_SHA256: 982b5aa772841168f8e380f139e9e787b2a105403e32b94da8676a0e1c0a13ab
 
 jobs:
   build:
@@ -104,48 +105,53 @@ jobs:
       # Called directly rather than through npm: this job sets up no Node.
       - run: python3 scripts/deploy-zh-cn.py --check
 
-      - name: Install ossutil
+      - name: Install rclone
         run: |
           set -euo pipefail
-          archive="ossutil-${OSSUTIL_VERSION}-linux-amd64"
-          curl -fsSL -o /tmp/ossutil.zip \
-            "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${archive}.zip"
+          archive="rclone-v${OMARCHY_RCLONE_VERSION}-linux-amd64"
+          curl -fsSL -o /tmp/rclone.zip \
+            "https://downloads.rclone.org/v${OMARCHY_RCLONE_VERSION}/${archive}.zip"
           # Verified before anything is unpacked, so a substituted archive never
           # gets executed on the runner that holds the publishing credentials.
-          echo "${OSSUTIL_SHA256}  /tmp/ossutil.zip" | sha256sum -c -
-          unzip -q /tmp/ossutil.zip -d /tmp
-          install -m 0755 "/tmp/${archive}/ossutil" /usr/local/bin/ossutil
-          ossutil version
+          echo "${OMARCHY_RCLONE_SHA256}  /tmp/rclone.zip" | sha256sum -c -
+          unzip -q /tmp/rclone.zip -d /tmp
+          install -m 0755 "/tmp/${archive}/rclone" /usr/local/bin/rclone
+          rclone version
 
-      # Four passes because --cache-control takes one value per invocation.
-      # Assets go up before HTML, so a page never references an asset that is
-      # not there yet. The last pass carries --delete: ossutil finishes every
-      # upload before constructing its deletor, and --ignore-existing means it
-      # uploads nothing, so it only removes objects the build dropped. Keeping
-      # --delete off the filtered passes matters -- their --include would make
-      # the rest of the site look like objects to delete.
+      # Three copies then one sync, because --header-upload takes one value per
+      # invocation. Assets go up before HTML, so a page never references an
+      # asset that is not there yet; the final sync carries no filter and no
+      # header, and exists only to delete what the build dropped. It copies
+      # nothing, because the three passes above already did.
+      #
+      # Every pass is --checksum: rclone compares the MD5 it reads from the
+      # bucket listing, so an unchanged file is skipped without a request of
+      # its own. --size-only would be cheaper still, but it cannot see an edit
+      # that leaves a file the same length, and that is a page silently not
+      # republished. rclone falls back to size only when no checksum exists;
+      # here one always does, since every object is written whole.
+      # ref: https://rclone.org/docs/#c-checksum
       - name: Publish to OSS
         env:
-          # ossutil reads these; they never appear in argv.
-          OSS_ACCESS_KEY_ID: ${{ secrets.OMARCHY_CN_ACCESS_KEY }}
-          OSS_ACCESS_KEY_SECRET: ${{ secrets.OMARCHY_CN_SECRET_KEY }}
+          # rclone reads its whole configuration from the environment, so no
+          # config file is written and no credential appears in argv.
+          # ref: https://rclone.org/docs/#config-file
+          RCLONE_CONFIG_OSS_TYPE: s3
+          RCLONE_CONFIG_OSS_PROVIDER: Alibaba
+          RCLONE_CONFIG_OSS_ACCESS_KEY_ID: ${{ secrets.OMARCHY_CN_ACCESS_KEY }}
+          RCLONE_CONFIG_OSS_SECRET_ACCESS_KEY: ${{ secrets.OMARCHY_CN_SECRET_KEY }}
           HOST: ${{ vars.OMARCHY_CN_OSS_HOST }}
         run: |
           set -euo pipefail
           bucket="${HOST%%.*}"
-          endpoint="${HOST#*.}"
-          region="$(printf '%s' "$endpoint" | sed -n 's/^oss-\(.*\)\.aliyuncs\.com$/\1/p')"
-          test -n "$region" || { echo "cannot derive region from $endpoint"; exit 1; }
-          echo "publishing dist/zh-CN to oss://$bucket/ via $endpoint (region $region)"
-          common=(-e "$endpoint" --region "$region")
-          sync=(sync dist/zh-CN/ "oss://$bucket/" --force -j 50)
-          # --checksum, --ignore-existing, --update and --size-only are
-          # mutually exclusive in ossutil, so each pass names its own.
+          export RCLONE_CONFIG_OSS_ENDPOINT="${HOST#*.}"
+          echo "publishing dist/zh-CN to oss:$bucket via $RCLONE_CONFIG_OSS_ENDPOINT"
+          common=(--checksum --fast-list --transfers 32 --checkers 32 --stats-one-line)
 
-          ossutil "${common[@]}" "${sync[@]}" --checksum --include '_astro/**' \
-            --cache-control 'public, max-age=31536000, immutable'
-          ossutil "${common[@]}" "${sync[@]}" --checksum --exclude '_astro/**' --exclude '*.html' \
-            --cache-control 'public, max-age=300'
-          ossutil "${common[@]}" "${sync[@]}" --checksum --include '*.html' \
-            --cache-control 'no-cache'
-          ossutil "${common[@]}" "${sync[@]}" --delete --ignore-existing
+          rclone copy dist/zh-CN "oss:$bucket" "${common[@]}" --include '/_astro/**' \
+            --header-upload 'Cache-Control: public, max-age=31536000, immutable'
+          rclone copy dist/zh-CN "oss:$bucket" "${common[@]}" --exclude '/_astro/**' --exclude '*.html' \
+            --header-upload 'Cache-Control: public, max-age=300'
+          rclone copy dist/zh-CN "oss:$bucket" "${common[@]}" --include '*.html' \
+            --header-upload 'Cache-Control: no-cache'
+          rclone sync dist/zh-CN "oss:$bucket" "${common[@]}"
